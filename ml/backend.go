@@ -156,10 +156,6 @@ func (m DeviceMemory) LogValue() slog.Value {
 		attrs = append(attrs, slog.Any("Graph", m.Graph))
 	}
 
-	if len(attrs) > 0 && m.UUID != "" {
-		attrs = append([]slog.Attr{slog.String("UUID", m.UUID)}, attrs...)
-	}
-
 	return slog.GroupValue(attrs...)
 }
 
