@@ -7,7 +7,10 @@ ARG JETPACK5VERSION=r35.4.1
 ARG JETPACK6VERSION=r36.4.0
 ARG CMAKEVERSION=3.31.2
 
-# We require gcc v10 minimum.  v10.3 has regressions, so the rockylinux 8.5 AppStream has the latest compatible version
+ARG ASCEND_VERSION=8.1.rc1-910b-openeuler22.03-py3.10
+ARG ASCEND_PRODUCT_NAME=CANN Atlas 800 A2
+
+# CUDA v11 requires gcc v10.  v10.3 has regressions, so the rockylinux 8.5 AppStream has the latest compatible version
 FROM --platform=linux/amd64 rocm/dev-almalinux-8:${ROCMVERSION}-complete AS base-amd64
 RUN yum install -y yum-utils \
     && yum-config-manager --add-repo https://dl.rockylinux.org/vault/rocky/8.5/AppStream/\$basearch/os/ \
@@ -77,6 +80,49 @@ RUN --mount=type=cache,target=/root/.ccache \
         && cmake --build --parallel --preset 'JetPack 6' \
         && cmake --install build --component CUDA --strip --parallel 8
 
+FROM quay.io/ascend/cann:${ASCEND_VERSION} AS cann-builder
+ARG GOLANG_VERSION
+RUN GOLANG_VERSION=${GOLANG_VERSION} \
+    dnf install -y git \
+    gcc \
+    gcc-c++ \
+    make \
+    cmake \
+    findutils \
+    yum \
+    pigz \
+    ccache
+RUN dnf clean all && \
+    dnf install -y \
+    zsh
+ARG CANN_INSTALL_DIR
+ENV GOARCH arm64
+ENV CGO_ENABLED 1
+ENTRYPOINT [ "zsh" ]
+
+FROM cann-builder AS cann-build
+ARG OLLAMA_FAST_BUILD=1
+ARG ASCEND_PRODUCT_NAME
+ARG VERSION
+COPY CMakeLists.txt CMakePresets.json .
+COPY ml/backend/ggml/ggml ml/backend/ggml/ggml
+RUN --mount=type=cache,target=/root/.ccache \
+    cann_in_sys_path=/usr/local/Ascend/ascend-toolkit; \
+    cann_in_user_path=$HOME/Ascend/ascend-toolkit; \
+    if [ -f "${cann_in_sys_path}/set_env.sh" ]; then \
+        source ${cann_in_sys_path}/set_env.sh; \
+        export LD_LIBRARY_PATH=${cann_in_sys_path}/latest/lib64:${cann_in_sys_path}/latest/${uname_m}-linux/devlib:${LD_LIBRARY_PATH} ; \
+    elif [ -f "${cann_in_user_path}/set_env.sh" ]; then \
+        source "$HOME/Ascend/ascend-toolkit/set_env.sh"; \
+        export LD_LIBRARY_PATH=${cann_in_user_path}/latest/lib64:${cann_in_user_path}/latest/${uname_m}-linux/devlib:${LD_LIBRARY_PATH}; \ 
+    else \
+        echo "No Ascend Toolkit found"; \
+        exit 1; \
+    fi && \
+    cmake --preset "${ASCEND_PRODUCT_NAME}" \
+        && cmake --build --parallel --preset "${ASCEND_PRODUCT_NAME}" \
+        && cmake --install build --component CANN
+
 FROM base AS build
 WORKDIR /go/src/github.com/ollama/ollama
 COPY go.mod go.sum .
@@ -104,7 +150,31 @@ FROM ${FLAVOR} AS archive
 COPY --from=cpu dist/lib/ollama /lib/ollama
 COPY --from=build /bin/ollama /bin/ollama
 
-FROM ubuntu:24.04
+# As release package compress operation is at the end of build linux, for cann different product need in different directory in dist 
+FROM scratch AS archive-cann
+COPY --from=cann-build dist/lib/ollama/cann /lib/ollama/cann
+COPY --from=cpu dist/lib/ollama /lib/ollama
+COPY --from=build /bin/ollama /bin/ollama
+
+FROM scratch AS archive-cann-atlas-a2
+COPY --from=cann-build dist/lib/ollama/cann /lib/ollama/cann_atlas_a2
+
+FROM scratch AS archive-cann-300i-duo
+COPY --from=cann-build dist/lib/ollama/cann /lib/ollama/cann_300i_duo
+
+FROM quay.io/ascend/cann:${ASCEND_VERSION} AS cann
+COPY --from=archive-cann /lib/ollama /usr/lib/ollama
+COPY --from=archive-cann /bin /usr/bin
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV LD_LIBRARY_PATH=/lib/ollama:/lib/ollama/cann:${LD_LIBRARY_PATH}
+ENV OLLAMA_DEBUG=1
+RUN echo "/bin/ollama serve" >> /usr/local/Ascend/ascend-toolkit/set_env.sh
+ENV OLLAMA_HOST=0.0.0.0:11434
+EXPOSE 11434
+ENTRYPOINT ["/bin/bash", "-c", "source /usr/local/Ascend/ascend-toolkit/set_env.sh && exec \"$@\"", "--"]
+CMD ["bash"]
+
+FROM ubuntu:20.04
 RUN apt-get update \
     && apt-get install -y ca-certificates \
     && apt-get clean \
